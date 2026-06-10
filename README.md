@@ -59,10 +59,19 @@ Run `atelier-coolify --help`, or let the `coolify` skill drive it. Common flow:
 
 ```sh
 atelier-coolify list                         # find the app UUID
+atelier-coolify deploy-mode <uuid>           # auto-deploy on push, or manual?
 atelier-coolify validate <uuid>              # status + logs if unhealthy
 atelier-coolify set-env <uuid> API_URL=https://api.example.com
 atelier-coolify deploy <uuid>                # apply the change
 ```
+
+`deploy-mode` reports whether the app auto-deploys on a push to its watched
+branch (GitHub App wiring) or needs a manual `deploy`. On an auto-deploy app a
+push to the watched branch *is* the deploy, so the `coolify` skill skips the
+redundant manual trigger for code changes (a `set-env` change still needs a
+`deploy`, since it does not go through git). The result is cached per project in
+`.coolify-deploy-mode.json` — add that file to the project's `.gitignore`; pass
+`--refresh` after changing the app's git settings in Coolify.
 
 ## How permissions work
 
@@ -78,6 +87,7 @@ persists across tasks and applies on top of atelier's per-task settings:
 "Bash(atelier-coolify logs:*)",
 "Bash(atelier-coolify deployments:*)",
 "Bash(atelier-coolify validate:*)",
+"Bash(atelier-coolify deploy-mode:*)",
 "Bash(atelier-coolify deploy:*)",
 "Bash(atelier-coolify set-env:*)",
 "Bash(atelier-coolify health:*)",

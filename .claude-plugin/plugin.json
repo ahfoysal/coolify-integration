@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "coolify-integration",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Coolify VPS deployment integration for atelier agents — validate, deploy, and manage applications via the Coolify v1 API",
   "author": {
     "name": "AkaLab-Tech",

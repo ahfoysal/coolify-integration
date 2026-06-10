@@ -12,7 +12,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 log()  { printf '==> %s\n' "$*"; }
@@ -25,6 +25,12 @@ pp()      { if command -v jq >/dev/null 2>&1; then jq .; else cat; fi; }
 # template). Resolution order mirrors how atelier/Claude Code locate it.
 ATELIER_SETTINGS="${COOLIFY_ATELIER_SETTINGS:-${ATELIER_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}/settings.json}"
 
+# Per-project record of each app's deploy mode, so the skill resolves it once
+# instead of re-assuming on every run. A JSON object keyed by app uuid, written
+# in the current project. Not a secret, but tied to a specific Coolify instance,
+# so keep it gitignored in the target project.
+COOLIFY_DEPLOY_MODE_FILE="${COOLIFY_DEPLOY_MODE_FILE:-.coolify-deploy-mode.json}"
+
 # Permissions granted to agents for routine Coolify operations. The gated
 # commands (create-app-public, delete-app) are intentionally absent so they
 # fall back to operator confirmation.
@@ -34,6 +40,7 @@ COOLIFY_ALLOW='[
   "Bash(atelier-coolify logs:*)",
   "Bash(atelier-coolify deployments:*)",
   "Bash(atelier-coolify validate:*)",
+  "Bash(atelier-coolify deploy-mode:*)",
   "Bash(atelier-coolify deploy:*)",
   "Bash(atelier-coolify set-env:*)",
   "Bash(atelier-coolify health:*)",
@@ -57,6 +64,9 @@ READ-ONLY
   logs <app-uuid> [lines]      Recent logs (default 100)
   deployments                  List running deployments
   validate <app-uuid>          Status + logs if unhealthy (exit 2 on failure)
+  deploy-mode <app-uuid>       Report deploy mode: 'auto' (a push to the watched
+                               [--refresh]            branch deploys) vs 'manual'.
+                               Cached per project; --refresh re-queries the API.
   health                       Coolify instance health
   version                      Coolify instance version
 
@@ -82,6 +92,8 @@ ENVIRONMENT
   COOLIFY_API_TOKEN            Required. Coolify API token (read/deploy/write).
   COOLIFY_ENV_FILE             Optional. Path to the project .env (default: .env)
   COOLIFY_ATELIER_SETTINGS     Optional. Path to atelier's user settings.json
+  COOLIFY_DEPLOY_MODE_FILE     Optional. Per-project deploy-mode cache
+                               (default: .coolify-deploy-mode.json)
 
 EXIT CODES
   0 success   1 error   2 validation failure (unhealthy deployment)
@@ -138,7 +150,11 @@ cmd_version()     { api GET "/version"; echo; }
 cmd_status() {
   local u="${1:?app-uuid required}"
   if command -v jq >/dev/null 2>&1; then
-    api GET "/applications/${u}" | jq '{uuid, name, status, fqdn, git_repository, git_branch}'
+    api GET "/applications/${u}" | jq '{uuid, name, status, fqdn, git_repository, git_branch,
+      auto_deploy: (if (.settings|type=="object") and (.settings|has("is_auto_deploy_enabled")) then .settings.is_auto_deploy_enabled
+                    elif has("is_auto_deploy_enabled") then .is_auto_deploy_enabled
+                    elif has("auto_deploy_enabled")    then .auto_deploy_enabled
+                    else null end)}'
   else
     api GET "/applications/${u}"
   fi
@@ -161,6 +177,71 @@ cmd_validate() {
     *running*|*healthy*) log "application is ${status}"; return 0 ;;
     *) log "application not healthy (status: ${status}); recent logs:"; cmd_logs "$u" 100; return 2 ;;
   esac
+}
+
+# --- deploy-mode: is this app wired to auto-deploy on push, or manual? --------
+
+# Read one app's cached entry to stdout; exit non-zero on miss / no cache.
+_deploy_mode_cache_get() {
+  local u="$1" f="$COOLIFY_DEPLOY_MODE_FILE" entry
+  [ -f "$f" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  entry="$(jq -e --arg u "$u" '.[$u]' "$f" 2>/dev/null)" || return 1
+  printf '%s' "$entry"
+}
+
+# Upsert one app's entry into the per-project cache, leaving other keys intact.
+_deploy_mode_cache_put() {
+  local u="$1" entry="$2" f="$COOLIFY_DEPLOY_MODE_FILE" tmp
+  command -v jq >/dev/null 2>&1 || return 0
+  [ -f "$f" ] && jq empty "$f" 2>/dev/null || printf '{}\n' > "$f"
+  tmp="$(mktemp)"
+  jq --arg u "$u" --argjson e "$entry" '.[$u] = $e' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+cmd_deploy_mode() {
+  require jq
+  local refresh="false" u=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --refresh) refresh="true" ;;
+      -*)        die "unknown flag: $1" ;;
+      *)         u="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$u" ] || die "app-uuid required"
+
+  if [ "$refresh" = "false" ]; then
+    local cached
+    if cached="$(_deploy_mode_cache_get "$u")"; then
+      printf '%s' "$cached" | jq '. + {source: "cache"}'
+      return 0
+    fi
+  fi
+
+  # Coolify exposes the auto-deploy flag and git wiring under version-dependent
+  # field names; probe the known locations and fall back to "unknown".
+  local app entry
+  app="$(api GET "/applications/${u}")"
+  # NB: jq's `//` discards `false` as well as `null`, so probe presence with
+  # `has` to tell an explicit `false` (manual) apart from an absent flag (unknown).
+  entry="$(printf '%s' "$app" | jq --arg u "$u" '
+    (if   (.settings|type=="object") and (.settings|has("is_auto_deploy_enabled")) then .settings.is_auto_deploy_enabled
+     elif has("is_auto_deploy_enabled") then .is_auto_deploy_enabled
+     elif has("auto_deploy_enabled")    then .auto_deploy_enabled
+     else null end) as $auto
+    | { uuid: (.uuid // $u),
+        name: .name,
+        git_repository: (.git_repository // .git_full_url // null),
+        watched_branch: (.git_branch // .branch // null),
+        git_source_connected: ((.source_id // .source.id // .git_source_id // null) != null),
+        auto_deploy_enabled: $auto,
+        deploy_mode: (if $auto == true then "auto"
+                      elif $auto == false then "manual"
+                      else "unknown" end) }')"
+  _deploy_mode_cache_put "$u" "$entry"
+  printf '%s' "$entry" | jq '. + {source: "live"}'
 }
 
 cmd_deploy() {
@@ -313,6 +394,7 @@ main() {
     logs)                cmd_logs "$@" ;;
     deployments)         cmd_deployments "$@" ;;
     validate)            cmd_validate "$@" ;;
+    deploy-mode)         cmd_deploy_mode "$@" ;;
     deploy)              cmd_deploy "$@" ;;
     set-env)             cmd_set_env "$@" ;;
     health)              cmd_health "$@" ;;
