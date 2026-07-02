@@ -5,7 +5,7 @@ Completed work log. Newest first. Each entry references the PR(s) that delivered
 ## 2026-07
 
 ### Security hardening: token off argv, in-CLI guards for destructive commands, query-string encoding — 2026-07-01
-**PR:** _not yet opened_ — branch `fix/token-and-confirm-guards`
+**PR:** [#5](https://github.com/AkaLab-Tech/coolify-integration/pull/5) — branch `fix/token-and-confirm-guards`
 
 Hardening pass on `scripts/atelier-coolify` from a security audit: the API
 token was visible in `ps` for the lifetime of every request, the destructive
