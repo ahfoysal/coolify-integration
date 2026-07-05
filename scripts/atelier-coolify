@@ -12,7 +12,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 log()  { printf '==> %s\n' "$*"; }
@@ -67,8 +67,9 @@ READ-ONLY
   logs <app-uuid> [lines]      Recent logs (default 100)
   deployments                  List running deployments
   validate <app-uuid>          Status + logs if unhealthy (exit 2 on failure)
-  deploy-mode <app-uuid>       Report deploy mode: 'auto' (a push to the watched
-                               [--refresh]            branch deploys) vs 'manual'.
+  deploy-mode <app-uuid>       Report cached/known deploy mode. Live API reads
+                               [--refresh]            return 'unknown' because
+                               the auto-deploy flag is not exposed.
                                Cached per project; --refresh re-queries the API.
   health                       Coolify instance health
   version                      Coolify instance version
@@ -193,7 +194,7 @@ cmd_validate() {
   esac
 }
 
-# --- deploy-mode: is this app wired to auto-deploy on push, or manual? --------
+# --- deploy-mode: cached/known mode, with live API reads falling back unknown --
 
 # Read one app's cached entry to stdout; exit non-zero on miss / no cache.
 _deploy_mode_cache_get() {
@@ -234,26 +235,19 @@ cmd_deploy_mode() {
     fi
   fi
 
-  # Coolify exposes the auto-deploy flag and git wiring under version-dependent
-  # field names; probe the known locations and fall back to "unknown".
   local app entry
   app="$(api GET "/applications/${u}")"
-  # NB: jq's `//` discards `false` as well as `null`, so probe presence with
-  # `has` to tell an explicit `false` (manual) apart from an absent flag (unknown).
+  # Coolify stores the auto-deploy bit on the ApplicationSetting relation, but
+  # the application endpoints do not expose that relation or a flattened flag.
+  # A live query therefore cannot distinguish auto vs manual with confidence.
   entry="$(printf '%s' "$app" | jq --arg u "$u" '
-    (if   (.settings|type=="object") and (.settings|has("is_auto_deploy_enabled")) then .settings.is_auto_deploy_enabled
-     elif has("is_auto_deploy_enabled") then .is_auto_deploy_enabled
-     elif has("auto_deploy_enabled")    then .auto_deploy_enabled
-     else null end) as $auto
-    | { uuid: (.uuid // $u),
+    { uuid: (.uuid // $u),
         name: .name,
         git_repository: (.git_repository // .git_full_url // null),
         watched_branch: (.git_branch // .branch // null),
         git_source_connected: ((.source_id // .source.id // .git_source_id // null) != null),
-        auto_deploy_enabled: $auto,
-        deploy_mode: (if $auto == true then "auto"
-                      elif $auto == false then "manual"
-                      else "unknown" end) }')"
+        auto_deploy_enabled: null,
+        deploy_mode: "unknown" }')"
   _deploy_mode_cache_put "$u" "$entry"
   printf '%s' "$entry" | jq '. + {source: "live"}'
 }
